@@ -3,7 +3,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from aiohttp import web
+from aiohttp import web, ClientSession
 import websockets
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
@@ -302,68 +302,105 @@ async def handle_callbacks(call):
         await bot.answer_callback_query(call.id, "🔄 Депозит сброшен до $1000!", show_alert=True)
 
 # ==========================================
-# ⚡ BINANCE WEBSOCKET + ГИБРИДНЫЙ АЛГОРИТМ
+# ⚡ ОБРАБОТКА ДВИЖЕНИЯ ЦЕНЫ
+# ==========================================
+async def process_price_update(current_price: float, last_price: float):
+    trader.current_btc_price = current_price
+
+    # Проверяем исполнение лимитных Maker-ордеров
+    fills = trader.check_limit_fills()
+    if ALLOWED_CHAT_ID:
+        for f in fills:
+            await bot.send_message(
+                ALLOWED_CHAT_ID,
+                f"🎯 **[MAKER FILL] Лимитный ордер исполнен!**\nВход по BTC: `${f['entry_btc_price']}`\nНачислено ребейтов: `+$0.10`",
+                parse_mode="Markdown"
+            )
+
+    # Логика Авто-трейдинга
+    if trader.auto_trade_enabled and last_price > 0:
+        change_pct = ((current_price - last_price) / last_price) * 100
+
+        # 🔥 ИМПУЛЬС (> 0.20%) -> Taker (Market)
+        if abs(change_pct) >= 0.20 and trader.balance >= 50:
+            side = "YES" if change_pct > 0 else "NO"
+            success, pos = trader.execute_market_order("BTC Pulse", side, 50.0)
+            if success and ALLOWED_CHAT_ID:
+                await bot.send_message(
+                    ALLOWED_CHAT_ID,
+                    f"🚨 **[TAKER SIGNAL] Сильный импульс `{round(change_pct, 2)}%`**\n"
+                    f"Заход по Маркету [{side}] | Списана комиссия 1.5%",
+                    parse_mode="Markdown"
+                )
+
+        # 📈 СПОКОЙНЫЙ РЫНОК -> Maker (Limit)
+        elif 0.05 <= abs(change_pct) < 0.20 and len(trader.pending_limits) < 2 and trader.balance >= 50:
+            side = "YES" if change_pct > 0 else "NO"
+            target_price = current_price * (0.9997 if side == "YES" else 1.0003)
+            success, order = trader.place_limit_order("BTC Grid", side, 50.0, round(target_price, 2))
+            if success and ALLOWED_CHAT_ID:
+                await bot.send_message(
+                    ALLOWED_CHAT_ID,
+                    f"⏳ **[MAKER GRID] Выставлен Лимит [{side}]**\n"
+                    f"Цель BTC: `${order['target_btc_price']}` (0% комиссия)",
+                    parse_mode="Markdown"
+                )
+
+# ==========================================
+# ⚡ BINANCE DATA STREAM (С ОБХОДОМ БЛОКИРОВОК)
 # ==========================================
 async def binance_websocket_loop():
-    url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    ws_urls = [
+        "wss://stream.binance.com:9443/ws/btcusdt@trade",
+        "wss://stream.binance.us:9443/ws/btcusdt@trade",
+        "wss://fstream.binance.com/ws/btcusdt@trade"
+    ]
+    
+    url_index = 0
     last_price = 0.0
+    ws_failed_count = 0
 
     while True:
+        # Если WebSocket блокируется (HTTP 451), переходим на быстрый REST API
+        if ws_failed_count >= 2:
+            try:
+                async with ClientSession() as session:
+                    async with session.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=3) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            current_price = float(data['price'])
+                            await process_price_update(current_price, last_price)
+                            last_price = current_price
+                        else:
+                            # Резервный источник CoinGecko
+                            async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=3) as cg_resp:
+                                cg_data = await cg_resp.json()
+                                current_price = float(cg_data['bitcoin']['usd'])
+                                await process_price_update(current_price, last_price)
+                                last_price = current_price
+            except Exception as e:
+                logging.error(f"REST Price Fetch Error: {e}")
+            
+            await asyncio.sleep(1)  # Проверяем цену раз в секунду
+            continue
+
+        # Пробуем подключиться к WebSocket
+        current_url = ws_urls[url_index]
         try:
-            async with websockets.connect(url) as ws:
-                logging.info("Подключено к Binance WS (Гибридный режим)")
+            async with websockets.connect(current_url) as ws:
+                logging.info(f"✅ Успешное подключение к WS: {current_url}")
+                ws_failed_count = 0
                 async for message in ws:
                     data = json.loads(message)
                     current_price = float(data['p'])
-                    trader.current_btc_price = current_price
-
-                    # Проверяем исполнение лимитных Maker-ордеров
-                    fills = trader.check_limit_fills()
-                    if ALLOWED_CHAT_ID:
-                        for f in fills:
-                            await bot.send_message(
-                                ALLOWED_CHAT_ID,
-                                f"🎯 **[MAKER FILL] Лимитный ордер исполнен!**\nВход по BTC: `${f['entry_btc_price']}`\nНачислено ребейтов: `+$0.10`",
-                                parse_mode="Markdown"
-                            )
-
-                    # Логика Авто-трейдинга
-                    if trader.auto_trade_enabled and last_price > 0:
-                        change_pct = ((current_price - last_price) / last_price) * 100
-
-                        # 🔥 ИМПУЛЬС (> 0.20%) -> Taker (Market)
-                        if abs(change_pct) >= 0.20 and trader.balance >= 50:
-                            side = "YES" if change_pct > 0 else "NO"
-                            success, pos = trader.execute_market_order("BTC Pulse", side, 50.0)
-                            if success and ALLOWED_CHAT_ID:
-                                last_price = current_price
-                                await bot.send_message(
-                                    ALLOWED_CHAT_ID,
-                                    f"🚨 **[TAKER SIGNAL] Сильный импульс `{round(change_pct, 2)}%`**\n"
-                                    f"Заход по Маркету [{side}] | Списана комиссия 1.5%",
-                                    parse_mode="Markdown"
-                                )
-
-                        # 📈 СПОКОЙНЫЙ РЫНОК -> Maker (Limit)
-                        elif 0.05 <= abs(change_pct) < 0.20 and len(trader.pending_limits) < 2 and trader.balance >= 50:
-                            side = "YES" if change_pct > 0 else "NO"
-                            target_price = current_price * (0.9997 if side == "YES" else 1.0003)
-                            success, order = trader.place_limit_order("BTC Grid", side, 50.0, round(target_price, 2))
-                            if success and ALLOWED_CHAT_ID:
-                                last_price = current_price
-                                await bot.send_message(
-                                    ALLOWED_CHAT_ID,
-                                    f"⏳ **[MAKER GRID] Выставлен Лимит [{side}]**\n"
-                                    f"Цель BTC: `${order['target_btc_price']}` (0% комиссия)",
-                                    parse_mode="Markdown"
-                                )
-
-                    if last_price == 0.0:
-                        last_price = current_price
+                    await process_price_update(current_price, last_price)
+                    last_price = current_price
 
         except Exception as e:
-            logging.error(f"WS Error: {e}")
-            await asyncio.sleep(5)
+            ws_failed_count += 1
+            logging.warning(f"⚠️ WS недоступен на {current_url}: {e}. Переключение на резервный режим...")
+            url_index = (url_index + 1) % len(ws_urls)
+            await asyncio.sleep(2)
 
 async def handle_ping(request):
     return web.Response(text="Hybrid Bot OK")
@@ -377,15 +414,13 @@ async def start_web_server():
     await site.start()
 
 async def main():
-    # 1. Предварительная загрузка профиля бота (Решает ошибку AttributeError)
     try:
         bot_user = await bot.get_me()
         logging.info(f"✅ Успешная авторизация бота: @{bot_user.username}")
     except Exception as e:
-        logging.error(f"❌ Не удалось авторизоваться в Telegram. Проверьте TELEGRAM_TOKEN в Render. Ошибка: {e}")
+        logging.error(f"❌ Не удалось авторизоваться в Telegram. Проверьте TELEGRAM_BOT_TOKEN в Render. Ошибка: {e}")
         return
 
-    # 2. Параллельный запуск веб-сервера, WebSocket и бота
     await asyncio.gather(
         start_web_server(),
         binance_websocket_loop(),
