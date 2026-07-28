@@ -535,4 +535,4 @@ class Polymarket:
             outcomes[nums.index(best)]
         ).strip().title()
         return winner if winner in {"Up", "Down"} else None
-    
+        
