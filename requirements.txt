@@ -1,5 +1,6 @@
-py-clob-client
+websocket-client
+requests
 pyTelegramBotAPI
-websockets
-aiohttp
 python-dotenv
+py-clob-client
+
