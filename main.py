@@ -11,12 +11,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ALLOWED_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+# Поддержка различных вариантов названия переменной токена
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+ALLOWED_CHAT_ID_ENV = os.getenv("TELEGRAM_CHAT_ID")
 INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "1000.0"))
 PORT = int(os.getenv("PORT", "8080"))
 
+# Динамический Chat ID (если не был задан заранее)
+ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID_ENV) if ALLOWED_CHAT_ID_ENV and ALLOWED_CHAT_ID_ENV.isdigit() else None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+if not TELEGRAM_TOKEN:
+    logging.critical("❌ ОШИБКА: TELEGRAM_TOKEN не найден в переменных окружения! Укажите его в панеле Render.")
+
+# Инициализация асинхронного бота
+bot = AsyncTeleBot(TELEGRAM_TOKEN)
 
 # ==========================================
 # 📊 ГИБРИДНЫЙ PAPER TRADER (LIMIT + MARKET)
@@ -111,7 +121,6 @@ class HybridPaperTrader:
     def check_limit_fills(self):
         filled_events = []
         for order in list(self.pending_limits):
-            # Если цена дошла до уровня лимитки — переводим в активную позицию
             is_filled = False
             if order['side'] == 'YES' and self.current_btc_price <= order['target_btc_price']:
                 is_filled = True
@@ -131,8 +140,7 @@ class HybridPaperTrader:
                 }
                 self.positions.append(pos)
                 self.pending_limits.remove(order)
-                # Зачисление Maker-бонуса за ликвидность ($0.10)
-                self.liquidity_rewards += 0.10
+                self.liquidity_rewards += 0.10  # Maker-бонус
                 filled_events.append(pos)
         return filled_events
 
@@ -167,7 +175,6 @@ class HybridPaperTrader:
         self.liquidity_rewards = 0.0
 
 trader = HybridPaperTrader(INITIAL_BALANCE)
-bot = AsyncTeleBot(TELEGRAM_TOKEN)
 
 # ==========================================
 # 🤖 ТЕЛЕГРАМ ИНТЕРФЕЙС
@@ -190,10 +197,20 @@ def get_main_keyboard():
     markup.add(btn_reset)
     return markup
 
+def is_authorized(chat_id):
+    global ALLOWED_CHAT_ID
+    if ALLOWED_CHAT_ID is None:
+        ALLOWED_CHAT_ID = chat_id
+        logging.info(f"🔑 Зафиксирован владелец бота: Chat ID = {chat_id}")
+        return True
+    return chat_id == ALLOWED_CHAT_ID
+
 @bot.message_handler(commands=['start', 'menu'])
 async def send_welcome(message):
-    if message.chat.id != ALLOWED_CHAT_ID:
+    if not is_authorized(message.chat.id):
+        await bot.send_message(message.chat.id, "⛔ Доступ ограничен владельцем бота.")
         return
+
     text = (
         "⚙️ **Polymarket Hybrid Bot (Limit + Market)**\n\n"
         "• **Maker-ордера:** 0% комиссия + начисление $0.10 ребейтов за ликвидность.\n"
@@ -204,7 +221,7 @@ async def send_welcome(message):
 
 @bot.callback_query_handler(func=lambda call: True)
 async def handle_callbacks(call):
-    if call.message.chat.id != ALLOWED_CHAT_ID:
+    if not is_authorized(call.message.chat.id):
         return
 
     if call.data == "stats":
@@ -260,7 +277,7 @@ async def handle_callbacks(call):
             await bot.answer_callback_query(call.id, pos, show_alert=True)
 
     elif call.data == "trade_limit":
-        target = trader.current_btc_price * 0.9995  # Покупка чуть ниже текущей цены
+        target = trader.current_btc_price * 0.9995
         success, order = trader.place_limit_order("BTC Limit Grid", "YES", 50.0, round(target, 2))
         if success:
             await bot.send_message(
@@ -300,24 +317,25 @@ async def binance_websocket_loop():
                     current_price = float(data['p'])
                     trader.current_btc_price = current_price
 
-                    # 1. Проверяем исполнение лимитных Maker-ордеров
+                    # Проверяем исполнение лимитных Maker-ордеров
                     fills = trader.check_limit_fills()
-                    for f in fills:
-                        await bot.send_message(
-                            ALLOWED_CHAT_ID,
-                            f"🎯 **[MAKER FILL] Лимитный ордер исполнен!**\nВход по BTC: `${f['entry_btc_price']}`\nНачислено ребейтов: `+$0.10`",
-                            parse_mode="Markdown"
-                        )
+                    if ALLOWED_CHAT_ID:
+                        for f in fills:
+                            await bot.send_message(
+                                ALLOWED_CHAT_ID,
+                                f"🎯 **[MAKER FILL] Лимитный ордер исполнен!**\nВход по BTC: `${f['entry_btc_price']}`\nНачислено ребейтов: `+$0.10`",
+                                parse_mode="Markdown"
+                            )
 
-                    # 2. Логика Авто-трейдинга
+                    # Логика Авто-трейдинга
                     if trader.auto_trade_enabled and last_price > 0:
                         change_pct = ((current_price - last_price) / last_price) * 100
 
-                        # 🔥 МОЩНЫЙ ИМПУЛЬС (> 0.20%) -> Быстрый Taker (Market)
+                        # 🔥 ИМПУЛЬС (> 0.20%) -> Taker (Market)
                         if abs(change_pct) >= 0.20 and trader.balance >= 50:
                             side = "YES" if change_pct > 0 else "NO"
                             success, pos = trader.execute_market_order("BTC Pulse", side, 50.0)
-                            if success:
+                            if success and ALLOWED_CHAT_ID:
                                 last_price = current_price
                                 await bot.send_message(
                                     ALLOWED_CHAT_ID,
@@ -326,12 +344,12 @@ async def binance_websocket_loop():
                                     parse_mode="Markdown"
                                 )
 
-                        # 📈 СПОКОЙНЫЙ РЫНОК (0.05% - 0.10%) -> Ставим Maker (Limit)
+                        # 📈 СПОКОЙНЫЙ РЫНОК -> Maker (Limit)
                         elif 0.05 <= abs(change_pct) < 0.20 and len(trader.pending_limits) < 2 and trader.balance >= 50:
                             side = "YES" if change_pct > 0 else "NO"
                             target_price = current_price * (0.9997 if side == "YES" else 1.0003)
                             success, order = trader.place_limit_order("BTC Grid", side, 50.0, round(target_price, 2))
-                            if success:
+                            if success and ALLOWED_CHAT_ID:
                                 last_price = current_price
                                 await bot.send_message(
                                     ALLOWED_CHAT_ID,
@@ -359,6 +377,15 @@ async def start_web_server():
     await site.start()
 
 async def main():
+    # 1. Предварительная загрузка профиля бота (Решает ошибку AttributeError)
+    try:
+        bot_user = await bot.get_me()
+        logging.info(f"✅ Успешная авторизация бота: @{bot_user.username}")
+    except Exception as e:
+        logging.error(f"❌ Не удалось авторизоваться в Telegram. Проверьте TELEGRAM_TOKEN в Render. Ошибка: {e}")
+        return
+
+    # 2. Параллельный запуск веб-сервера, WebSocket и бота
     await asyncio.gather(
         start_web_server(),
         binance_websocket_loop(),
@@ -367,3 +394,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+        
