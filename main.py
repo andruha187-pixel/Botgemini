@@ -1,433 +1,538 @@
-import os
 import json
-import time
-import asyncio
 import logging
-from datetime import datetime
+import re
+import threading
+import time
 from collections import deque
-import websockets
-from aiohttp import web, ClientSession
-from py_clob_client.client import ClobClient
-from telebot.async_telebot import AsyncTeleBot
-from telebot import types
-from dotenv import load_dotenv
+from typing import Any, List, Optional, Tuple
 
-load_dotenv()
+import requests
+import websocket
 
-# --- Переменные окружения ---
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_CHAT_ID_ENV = os.getenv("TELEGRAM_CHAT_ID")
-INITIAL_BALANCE = float(os.getenv("INITIAL_BALANCE", "1000.0"))
-PORT = int(os.getenv("PORT", "8080"))
+from config import Config
+from models import Market
 
-ALLOWED_CHAT_ID = int(ALLOWED_CHAT_ID_ENV) if ALLOWED_CHAT_ID_ENV and ALLOWED_CHAT_ID_ENV.isdigit() else None
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
-if not TELEGRAM_TOKEN:
-    logging.critical("❌ ОШИБКА: TELEGRAM_TOKEN не найден!")
 
-bot = AsyncTeleBot(TELEGRAM_TOKEN)
-clob_client = ClobClient(host="https://clob.polymarket.com", chain_id=137)
+def parse_array(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            result = json.loads(value)
+            return result if isinstance(result, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []
 
-# --- Настройки 5-минутной гибридной стратегии ---
-TARGET_ASSETS = ["BTC", "ETH", "SOL", "DOGE", "BNB", "XRP", "HYPE"]
-MOMENTUM_THRESHOLD = 0.20  # Порог импульса на Binance в % за 5 сек
-LOOKBACK_SECONDS = 5       # Окно анализа тиков
-MAKER_SPREAD_OFFSET = 0.01 # Отступ для лимитного ордера ($0.01)
-TAKER_COMMISSION = 0.03    # Повышенная Taker-комиссия Polymarket на 5m рынках (~3%)
 
-# Глобальное состояние
-binance_prices = {asset: 0.0 for asset in TARGET_ASSETS}
-binance_histories = {asset: deque() for asset in TARGET_ASSETS}
-last_signal_times = {asset: 0 for asset in TARGET_ASSETS}
+class ChainlinkPriceFeed:
+    SYMBOLS = {
+        "BTC": "btc/usd",
+        "ETH": "eth/usd",
+    }
 
-# ==========================================
-# 📊 HYBRID 5M PAPER TRADER
-# ==========================================
-class HybridPaperTrader:
-    def __init__(self, initial_balance: float):
-        self.initial_balance = initial_balance
-        self.balance = initial_balance
-        self.positions = []           # Taker сделки
-        self.active_limit_orders = {} # Maker ордера: {asset: [orders]}
-        self.trade_history = []
-        self.current_mode = "MAKER"
-        self.auto_trade_enabled = True
-        self.markets = {} # {asset: {"question": str, "yes_token": str, "no_token": str, "yes_price": float, "no_price": float}}
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+        self.ws: Optional[websocket.WebSocketApp] = None
+        self.history = {
+            symbol: deque(maxlen=10000)
+            for symbol in self.SYMBOLS
+        }
 
-    def cancel_all_limits(self):
-        """Мгновенная отмена всех Maker-лимиток при обнаружении импульса"""
-        count = sum(len(v) for v in self.active_limit_orders.values())
-        self.active_limit_orders.clear()
-        return count
-
-    def update_maker_orders(self, asset: str, best_bid: float, best_ask: float):
-        """Режим MAKER: Моделирование установки лимиток во внутренний спред"""
-        if best_bid <= 0 or best_ask <= 0:
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
             return
-        
-        my_bid = round(best_bid + MAKER_SPREAD_OFFSET, 2)
-        my_ask = round(best_ask - MAKER_SPREAD_OFFSET, 2)
-
-        if my_bid < my_ask:
-            self.active_limit_orders[asset] = [
-                {"side": "BUY_LIMIT", "price": my_bid, "amount": 20.0},
-                {"side": "SELL_LIMIT", "price": my_ask, "amount": 20.0}
-            ]
-
-    def execute_taker_trade(self, asset: str, side: str, reason: str):
-        """Режим TAKER: Вход по маркету с учетом 5m Taker-комиссии"""
-        self.cancel_all_limits()
-        
-        m_data = self.markets.get(asset, {})
-        ask_price = m_data.get('yes_price', 0.50)
-        bid_price = round(1.0 - m_data.get('no_price', 0.50), 4)
-
-        entry_price = ask_price if side == "YES" else round(1.0 - bid_price, 4)
-        if entry_price <= 0 or entry_price >= 1.0:
-            return False, "Некорректная цена в стакане"
-
-        trade_amount = 25.0
-        fee = trade_amount * TAKER_COMMISSION
-        total_cost = trade_amount + fee
-
-        if self.balance < total_cost:
-            return False, "Недостаточно баланса"
-
-        shares = trade_amount / entry_price
-        self.balance -= total_cost
-
-        pos = {
-            "id": len(self.positions) + len(self.trade_history) + 1,
-            "mode": "TAKER ⚡ 5M",
-            "asset": asset,
-            "question": m_data.get("question", asset)[:35] + "...",
-            "side": side,
-            "amount": trade_amount,
-            "shares": round(shares, 2),
-            "entry_price": entry_price,
-            "fee": round(fee, 2),
-            "reason": reason,
-            "timestamp": datetime.now().strftime("%H:%M:%S")
-        }
-        self.positions.append(pos)
-        return True, pos
-
-    def get_stats(self):
-        realized_pnl = sum(t.get('pnl', 0) for t in self.trade_history)
-        unrealized_pnl = 0.0
-
-        for pos in self.positions:
-            asset = pos['asset']
-            side = pos['side']
-            m_data = self.markets.get(asset, {})
-            curr_price = m_data.get('yes_price' if side == 'YES' else 'no_price', pos['entry_price'])
-            val = pos['shares'] * curr_price
-            unrealized_pnl += (val - pos['amount'])
-
-        total_pnl = realized_pnl + unrealized_pnl
-        equity = self.balance + sum(p['amount'] for p in self.positions) + unrealized_pnl
-        roi = ((equity - self.initial_balance) / self.initial_balance) * 100 if self.initial_balance > 0 else 0
-        total_limits = sum(len(v) for v in self.active_limit_orders.values())
-
-        return {
-            "cash_balance": round(self.balance, 2),
-            "equity": round(equity, 2),
-            "total_pnl": round(total_pnl, 2),
-            "roi": round(roi, 2),
-            "active_positions": len(self.positions),
-            "active_limits": total_limits
-        }
-
-    def close_all_positions(self):
-        closed = []
-        for pos in list(self.positions):
-            asset = pos['asset']
-            side = pos['side']
-            m_data = self.markets.get(asset, {})
-            exit_price = m_data.get('yes_price' if side == 'YES' else 'no_price', pos['entry_price'])
-            
-            payout = pos['shares'] * exit_price
-            pnl = payout - pos['amount']
-            self.balance += payout
-
-            record = {**pos, "exit_price": exit_price, "pnl": round(pnl, 2)}
-            self.trade_history.append(record)
-            closed.append(record)
-            self.positions.remove(pos)
-        return closed
-
-    def reset_account(self):
-        self.balance = self.initial_balance
-        self.positions.clear()
-        self.active_limit_orders.clear()
-        self.trade_history.clear()
-
-trader = HybridPaperTrader(INITIAL_BALANCE)
-
-# ==========================================
-# 🔍 АВТО-ПОИСК 5-МИНУТНЫХ РЫНКОВ (GAMMA API)
-# ==========================================
-async def fetch_5m_polymarket_markets():
-    """Динамический поиск и переподключение к свежим 5-минутным рынкам"""
-    url = "https://gamma-api.polymarket.com/events?limit=100&active=true&closed=false&order=startDate&ascending=false"
-    async with ClientSession() as session:
-        try:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    events = await resp.json()
-                    for event in events:
-                        title = event.get('title', '').upper()
-                        
-                        # Фильтруем события с меткой 5m / 5-minute
-                        if any(m in title for m in ["5M", "5 MINUTE", "5-MINUTE"]):
-                            for asset in TARGET_ASSETS:
-                                if asset in title:
-                                    markets = event.get('markets', [])
-                                    if markets:
-                                        m = markets[0]
-                                        clob_ids = m.get('clobTokenIds')
-                                        if clob_ids and len(clob_ids) >= 2:
-                                            trader.markets[asset] = {
-                                                "question": m.get('question', title),
-                                                "yes_token": clob_ids[0],
-                                                "no_token": clob_ids[1],
-                                                "yes_price": trader.markets.get(asset, {}).get('yes_price', 0.50),
-                                                "no_price": trader.markets.get(asset, {}).get('no_price', 0.50)
-                                            }
-                    logging.info(f"🔄 Активные 5m рынки обновлены: {list(trader.markets.keys())}")
-        except Exception as e:
-            logging.error(f"❌ Ошибка Gamma API 5m: {e}")
-
-# ==========================================
-# ⚡ BINANCE MULTI-STREAM WEBSOCKET
-# ==========================================
-async def binance_ws_loop():
-    """Слушает тики по монетам в реальном времени"""
-    stream_assets = [a for a in TARGET_ASSETS if a != "HYPE"]
-    streams = "/".join([f"{asset.lower()}usdt@trade" for asset in stream_assets])
-    uri = f"wss://stream.binance.com:9443/stream?streams={streams}"
-
-    while True:
-        try:
-            async with websockets.connect(uri) as ws:
-                logging.info("🌐 Binance Multi-Stream WebSocket подключен!")
-                while True:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    if 'data' not in data:
-                        continue
-                    
-                    trade_data = data['data']
-                    symbol = trade_data['s'].replace("USDT", "")
-                    price = float(trade_data['p'])
-                    now = time.time()
-
-                    binance_prices[symbol] = price
-                    history = binance_histories[symbol]
-                    history.append((now, price))
-
-                    while history and (now - history[0][0]) > LOOKBACK_SECONDS:
-                        history.popleft()
-
-                    # Проверка условий TAKER-снайпинга
-                    if len(history) > 1 and trader.auto_trade_enabled:
-                        old_price = history[0][1]
-                        pct_change = ((price - old_price) / old_price) * 100
-
-                        if abs(pct_change) >= MOMENTUM_THRESHOLD and (now - last_signal_times[symbol]) > 10:
-                            if symbol in trader.markets:
-                                last_signal_times[symbol] = now
-                                trader.current_mode = "TAKER"
-
-                                side = "YES" if pct_change > 0 else "NO"
-                                reason = f"Binance {symbol} {pct_change:+.2f}% за {LOOKBACK_SECONDS}s"
-
-                                logging.info(f"🚨 5M TAKER СИГНАЛ: {reason}")
-                                success, pos = trader.execute_taker_trade(symbol, side, reason)
-
-                                if success and ALLOWED_CHAT_ID:
-                                    await bot.send_message(
-                                        ALLOWED_CHAT_ID,
-                                        f"⚡ **[HYBRID 5M EXECUTION]**\n"
-                                        f"Рынок: **{symbol} (5m)** | Сигнал: `{reason}`\n"
-                                        f"Исход: **{side}** | Вход: `${pos['entry_price']}`\n"
-                                        f"Объем: `${pos['amount']}` USDC (Комиссия 3%: `${pos['fee']}`)",
-                                        parse_mode="Markdown"
-                                    )
-
-                                await asyncio.sleep(2)
-                                trader.current_mode = "MAKER"
-
-        except Exception as e:
-            logging.error(f"❌ Ошибка Binance WS: {e}")
-            await asyncio.sleep(3)
-
-# ==========================================
-# 📖 ЧТЕНИЕ СТАКАНОФ И ВЕДЕНИЕ MAKER-РЕЖИМА
-# ==========================================
-async def polymarket_clob_loop():
-    last_update_time = 0
-    while True:
-        try:
-            now = time.time()
-            # Обновляем 5-минутные контракты каждые 30 секунд
-            if now - last_update_time > 30:
-                await fetch_5m_polymarket_markets()
-                last_update_time = now
-
-            for asset, m_data in list(trader.markets.items()):
-                try:
-                    orderbook = clob_client.get_order_book(m_data['yes_token'])
-                    best_ask = float(orderbook.asks[0].price) if orderbook.asks else 0.0
-                    best_bid = float(orderbook.bids[0].price) if orderbook.bids else 0.0
-
-                    if best_ask > 0:
-                        m_data['yes_price'] = best_ask
-                        m_data['no_price'] = round(1.0 - best_bid, 4)
-
-                        if trader.current_mode == "MAKER":
-                            trader.update_maker_orders(asset, best_bid, best_ask)
-                except Exception:
-                    pass
-
-        except Exception as e:
-            logging.error(f"Ошибка в цикле CLOB: {e}")
-
-        await asyncio.sleep(2)
-
-# ==========================================
-# 🤖 ТЕЛЕГРАМ ИНТЕРФЕЙС
-# ==========================================
-def get_main_keyboard():
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    btn_pnl = types.InlineKeyboardButton("📊 5m Рынки & PnL", callback_data="stats")
-    btn_pos = types.InlineKeyboardButton("💼 Позиции", callback_data="positions")
-    btn_close = types.InlineKeyboardButton("🧹 Закрыть все", callback_data="close_all")
-    btn_toggle = types.InlineKeyboardButton(
-        f"🤖 Авто-трейд: {'ВКЛ 🟢' if trader.auto_trade_enabled else 'ВЫКЛ 🔴'}", 
-        callback_data="toggle_auto"
-    )
-    btn_reset = types.InlineKeyboardButton("🔄 Сброс баланса", callback_data="reset")
-    markup.add(btn_pnl, btn_pos)
-    markup.add(btn_close, btn_toggle)
-    markup.add(btn_reset)
-    return markup
-
-def is_authorized(chat_id):
-    global ALLOWED_CHAT_ID
-    if ALLOWED_CHAT_ID is None:
-        ALLOWED_CHAT_ID = chat_id
-        return True
-    return chat_id == ALLOWED_CHAT_ID
-
-@bot.message_handler(commands=['start', 'menu'])
-async def send_welcome(message):
-    if not is_authorized(message.chat.id):
-        await bot.send_message(message.chat.id, "⛔ Доступ ограничен.")
-        return
-
-    text = (
-        "🤖 **Polymarket 5m Hybrid Bot**\n\n"
-        f"• **Мониторинг 5m рынков:** `{', '.join(TARGET_ASSETS)}`\n"
-        "• **Binance Stream:** Multi-WebSocket (BTC/ETH/SOL/DOGE/BNB/XRP)\n"
-        "• **Авто-ротация:** Ротация 5-минутных контрактов каждые 30 сек\n"
-        "• **MAKER:** Пассивный сбор спреда в спокойный рынок\n"
-        "• **TAKER:** Снайпинг импульсов $\ge 0.20\%$ (учитывает 3% комиссию)"
-    )
-    await bot.send_message(message.chat.id, text, parse_mode="Markdown", reply_markup=get_main_keyboard())
-
-@bot.callback_query_handler(func=lambda call: True)
-async def handle_callbacks(call):
-    if not is_authorized(call.message.chat.id):
-        return
-
-    if call.data == "stats":
-        s = trader.get_stats()
-        pnl_icon = "🟩" if s['total_pnl'] >= 0 else "🟥"
-
-        prices_str = ""
-        for asset in TARGET_ASSETS:
-            b_price = binance_prices.get(asset, 0.0)
-            m_data = trader.markets.get(asset, {})
-            y_price = m_data.get('yes_price', 0.0)
-            n_price = m_data.get('no_price', 0.0)
-            prices_str += f"• **{asset} (5m):** Spot `${b_price:,.2f}` | YES `${y_price}` / NO `${n_price}`\n"
-
-        text = (
-            f"📊 **5-МИНУТНЫЕ РЫНКИ & PnL**\n"
-            f"───────────────────\n"
-            f"{prices_str}\n"
-            f"📍 **Режим:** `{trader.current_mode}`\n"
-            f"💵 **Депозит:** `${s['cash_balance']}` USDC\n"
-            f"💎 **Equity:** `${s['equity']}` USDC\n"
-            f"{pnl_icon} **PnL:** `${s['total_pnl']}` USDC ({s['roi']}%)\n"
-            f"📌 **Maker-лимитки:** `{s['active_limits']}` шт.\n"
-            f"💼 **Taker-позиции:** `{s['active_positions']}` шт."
+        self.stop_event.clear()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="polymarket-chainlink-rtds",
+            daemon=True,
         )
-        await bot.edit_message_text(text, call.message.chat.id, call.message.message_id, 
-                                   parse_mode="Markdown", reply_markup=get_main_keyboard())
+        self.thread.start()
 
-    elif call.data == "positions":
-        if not trader.positions:
-            await bot.answer_callback_query(call.id, "📭 Нет активных позиций!")
+    def stop(self) -> None:
+        self.stop_event.set()
+        ws = self.ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _subscription(self) -> str:
+        subscriptions = []
+        for feed_symbol in self.SYMBOLS.values():
+            subscriptions.append({
+                "topic": "crypto_prices_chainlink",
+                "type": "*",
+                "filters": json.dumps(
+                    {"symbol": feed_symbol},
+                    separators=(",", ":"),
+                ),
+            })
+        return json.dumps({
+            "action": "subscribe",
+            "subscriptions": subscriptions,
+        })
+
+    def _on_open(self, ws) -> None:
+        ws.send(self._subscription())
+        log.info(
+            "Polymarket RTDS Chainlink подключён: BTC/USD, ETH/USD"
+        )
+
+        def heartbeat():
+            while (
+                not self.stop_event.wait(5)
+                and self.ws is ws
+            ):
+                try:
+                    ws.send("PING")
+                except Exception:
+                    return
+
+        threading.Thread(
+            target=heartbeat,
+            name="rtds-heartbeat",
+            daemon=True,
+        ).start()
+
+    def _on_message(self, _ws, message: str) -> None:
+        if message in {"PONG", "PING"}:
             return
 
-        text = "💼 **ОТКРЫТЫЕ 5M ПОЗИЦИИ:**\n\n"
-        for p in trader.positions:
-            m_data = trader.markets.get(p['asset'], {})
-            curr_p = m_data.get('yes_price' if p['side'] == 'YES' else 'no_price', p['entry_price'])
-            pnl = (p['shares'] * curr_p) - p['amount']
-            icon = "🟢" if pnl >= 0 else "🔴"
-            text += (
-                f"🔹 **[{p['asset']}] {p['side']}** ({p['mode']})\n"
-                f"└ Сигнал: `{p['reason']}`\n"
-                f"└ Вход: `${p['entry_price']}` | Текущая: `${curr_p}`\n"
-                f"└ PnL: {icon} `${round(pnl, 2)}` USDC\n\n"
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            return
+
+        if isinstance(payload, list):
+            for item in payload:
+                self._consume(item)
+        else:
+            self._consume(payload)
+
+    def _consume(self, message: Any) -> None:
+        if not isinstance(message, dict):
+            return
+
+        topic = str(message.get("topic") or "")
+        if topic not in {
+            "crypto_prices_chainlink",
+            "prices.crypto.chainlink",
+        }:
+            return
+
+        payload = message.get("payload") or {}
+        if not isinstance(payload, dict):
+            return
+
+        feed_symbol = str(
+            payload.get("symbol") or ""
+        ).lower()
+
+        symbol = next(
+            (
+                coin
+                for coin, value in self.SYMBOLS.items()
+                if value == feed_symbol
+            ),
+            None,
+        )
+        if symbol is None:
+            return
+
+        try:
+            value = float(payload["value"])
+            timestamp_ms = float(
+                payload.get("timestamp")
+                or message.get("timestamp")
+                or time.time() * 1000
             )
-        await bot.send_message(call.message.chat.id, text, parse_mode="Markdown")
-        await bot.answer_callback_query(call.id)
+        except (KeyError, TypeError, ValueError):
+            return
 
-    elif call.data == "close_all":
-        closed = trader.close_all_positions()
-        await bot.send_message(call.message.chat.id, f"🧹 Закрыто 5m позиций: {len(closed)}.")
+        timestamp_s = (
+            timestamp_ms / 1000.0
+            if timestamp_ms > 10_000_000_000
+            else timestamp_ms
+        )
 
-    elif call.data == "toggle_auto":
-        trader.auto_trade_enabled = not trader.auto_trade_enabled
-        await bot.answer_callback_query(call.id, f"Авто-трейдинг: {trader.auto_trade_enabled}")
-        await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=get_main_keyboard())
+        with self.lock:
+            self.history[symbol].append(
+                (timestamp_s, value)
+            )
 
-    elif call.data == "reset":
-        trader.reset_account()
-        await bot.answer_callback_query(call.id, "🔄 Баланс сброшен!", show_alert=True)
+    def _on_error(self, _ws, error) -> None:
+        log.warning("RTDS Chainlink error: %s", error)
 
-# ==========================================
-# 🌐 WEB SERVER & MAIN
-# ==========================================
-async def handle_ping(request):
-    return web.Response(text="5m Hybrid Bot OK")
+    def _on_close(self, _ws, code, reason) -> None:
+        log.warning(
+            "RTDS Chainlink закрыт: code=%s reason=%s",
+            code,
+            reason,
+        )
 
-async def main():
-    app = web.Application()
-    app.router.add_get('/', handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self.ws = websocket.WebSocketApp(
+                    self.cfg.rtds_url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self.ws.run_forever(
+                    ping_interval=0,
+                    ping_timeout=None,
+                )
+            except Exception:
+                log.exception("Ошибка цикла RTDS Chainlink")
 
-    try:
-        bot_user = await bot.get_me()
-        logging.info(f"✅ Успешный старт бота: @{bot_user.username}")
-    except Exception as e:
-        logging.error(f"❌ Ошибка авторизации: {e}")
+            self.ws = None
+            if not self.stop_event.wait(3):
+                log.info(
+                    "Повторное подключение RTDS Chainlink через 3 сек."
+                )
 
-    await asyncio.gather(
-        binance_ws_loop(),
-        polymarket_clob_loop(),
-        bot.polling(non_stop=True)
-    )
+    def latest(
+        self,
+        symbol: str,
+        max_age: Optional[float] = None,
+    ) -> Optional[Tuple[float, float]]:
+        with self.lock:
+            items = list(
+                self.history.get(symbol.upper(), ())
+            )
 
-if __name__ == "__main__":
-    asyncio.run(main())
+        if not items:
+            return None
+
+        timestamp_s, value = items[-1]
+        allowed_age = (
+            self.cfg.chainlink_max_tick_age_seconds
+            if max_age is None
+            else max_age
+        )
+        if time.time() - timestamp_s > allowed_age:
+            return None
+        return timestamp_s, value
+
+    def nearest(
+        self,
+        symbol: str,
+        boundary_ts: float,
+        tolerance: Optional[float] = None,
+        prefer_after: bool = False,
+    ) -> Optional[Tuple[float, float]]:
+        with self.lock:
+            items = list(
+                self.history.get(symbol.upper(), ())
+            )
+
+        if not items:
+            return None
+
+        tolerance_s = (
+            self.cfg.chainlink_boundary_tolerance_seconds
+            if tolerance is None
+            else tolerance
+        )
+
+        candidates = [
+            item
+            for item in items
+            if abs(item[0] - boundary_ts) <= tolerance_s
+        ]
+        if not candidates:
+            return None
+
+        if prefer_after:
+            after = [
+                item
+                for item in candidates
+                if item[0] >= boundary_ts
+            ]
+            if after:
+                return min(
+                    after,
+                    key=lambda item: item[0] - boundary_ts,
+                )
+
+        return min(
+            candidates,
+            key=lambda item: abs(item[0] - boundary_ts),
+        )
+
+
+class Polymarket:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.http = requests.Session()
+        self.http.headers.update({
+            "User-Agent": "polymarket-demo-bot/5.0"
+        })
+        self.market_cache = {}
+        self.chainlink = ChainlinkPriceFeed(cfg)
+
+    def start(self) -> None:
+        self.chainlink.start()
+
+    def stop(self) -> None:
+        self.chainlink.stop()
+
+    @staticmethod
+    def current_start(now: Optional[int] = None) -> int:
+        """Округление времени вниз до ближайшего 5-минутного интервала (300 сек)"""
+        now = int(now or time.time())
+        return (now // 300) * 300
+
+    def get_5m_markets(
+        self, 
+        symbols: List[str] = ["BTC", "ETH"], 
+        offset_intervals: int = 0
+    ) -> List[Market]:
+        """
+        Поиск и получение активных/предстоящих 5-минутных рынков.
+        :param symbols: список монет (например, ['BTC', 'ETH'])
+        :param offset_intervals: 0 - текущий рынок, 1 - следующий 5m рынок, -1 - предыдущий
+        """
+        start_ts = self.current_start() + (offset_intervals * 300)
+        markets = []
+        for symbol in symbols:
+            market = self.get_market(symbol=symbol, start_ts=start_ts)
+            if market:
+                markets.append(market)
+        return markets
+
+    def get_market(
+        self,
+        symbol: str,
+        start_ts: int,
+    ) -> Optional[Market]:
+        # Генерация слага 5-минутного рынка по стандарту Polymarket
+        slug = f"{symbol.lower()}-updown-5m-{start_ts}"
+
+        cached = self.market_cache.get(slug)
+        if cached:
+            return cached
+
+        log.info("[%s] Ищу рынок: %s", symbol, slug)
+        response = self.http.get(
+            f"{self.cfg.gamma_url}/markets",
+            params={"slug": slug, "limit": 10},
+            timeout=15,
+        )
+        response.raise_for_status()
+        items = response.json()
+
+        if not isinstance(items, list) or not items:
+            log.warning("[%s] Рынок не найден: %s", symbol, slug)
+            return None
+
+        item = next(
+            (x for x in items if x.get("slug") == slug),
+            None,
+        )
+        if not item:
+            log.warning("[%s] Gamma вернула другой slug", symbol)
+            return None
+
+        outcomes = [
+            str(x).strip().lower()
+            for x in parse_array(item.get("outcomes"))
+        ]
+        token_ids = [
+            str(x)
+            for x in parse_array(item.get("clobTokenIds"))
+        ]
+        mapping = dict(zip(outcomes, token_ids))
+
+        if "up" not in mapping or "down" not in mapping:
+            raise RuntimeError(
+                f"{slug}: нет токенов Up/Down; "
+                f"outcomes={outcomes}"
+            )
+
+        market = Market(
+            symbol=symbol,
+            slug=slug,
+            start_ts=start_ts,
+            end_ts=start_ts + 300,
+            condition_id=str(item.get("conditionId", "")),
+            up_token_id=mapping["up"],
+            down_token_id=mapping["down"],
+        )
+        self.market_cache[slug] = market
+        return market
+
+    def get_book(self, token_id: str) -> dict:
+        response = self.http.get(
+            f"{self.cfg.clob_url}/book",
+            params={"token_id": token_id},
+            timeout=8,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _best(levels, side: str) -> Optional[float]:
+        values = []
+        for level in levels or []:
+            try:
+                price = float(level["price"])
+                size = float(level["size"])
+                if size > 0:
+                    values.append(price)
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not values:
+            return None
+        return max(values) if side == "bid" else min(values)
+
+    def bid_ask(
+        self,
+        token_id: str,
+    ) -> Tuple[Optional[float], Optional[float]]:
+        book = self.get_book(token_id)
+        return (
+            self._best(book.get("bids"), "bid"),
+            self._best(book.get("asks"), "ask"),
+        )
+
+    def estimate_buy(
+        self,
+        token_id: str,
+        amount: float,
+    ) -> Tuple[float, float]:
+        book = self.get_book(token_id)
+        asks = []
+        for level in book.get("asks", []):
+            try:
+                asks.append((
+                    float(level["price"]),
+                    float(level["size"]),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        asks.sort()
+
+        remaining = amount
+        spent = 0.0
+        shares = 0.0
+
+        for price, available in asks:
+            if remaining <= 0.0001:
+                break
+            cost = min(remaining, price * available)
+            spent += cost
+            shares += cost / price
+            remaining -= cost
+
+        if shares <= 0:
+            raise RuntimeError("В стакане нет ask")
+        if remaining > 0.01:
+            raise RuntimeError(
+                f"Недостаточно ликвидности: "
+                f"найдено ${spent:.2f} из ${amount:.2f}"
+            )
+        return spent / shares, shares
+
+    def chainlink_target(
+        self,
+        symbol: str,
+        start_ts: float,
+    ) -> Optional[Tuple[float, float]]:
+        return self.chainlink.nearest(
+            symbol=symbol,
+            boundary_ts=start_ts,
+            prefer_after=True,
+        )
+
+    def chainlink_latest(
+        self,
+        symbol: str,
+    ) -> Optional[Tuple[float, float]]:
+        return self.chainlink.latest(symbol)
+
+    def chainlink_final(
+        self,
+        symbol: str,
+        end_ts: float,
+    ) -> Optional[Tuple[float, float]]:
+        return self.chainlink.nearest(
+            symbol=symbol,
+            boundary_ts=end_ts,
+            prefer_after=True,
+        )
+
+    def chainlink_result(
+        self,
+        symbol: str,
+        start_ts: float,
+        end_ts: Optional[float] = None,
+        use_latest: bool = False,
+    ) -> Optional[Tuple[str, float, float, float]]:
+        target_item = self.chainlink_target(
+            symbol,
+            start_ts,
+        )
+        if not target_item:
+            return None
+
+        price_item = (
+            self.chainlink_latest(symbol)
+            if use_latest
+            else self.chainlink_final(
+                symbol,
+                end_ts if end_ts is not None else time.time(),
+            )
+        )
+        if not price_item:
+            return None
+
+        _target_ts, target_price = target_item
+        price_ts, price = price_item
+        result = "Up" if price >= target_price else "Down"
+        return result, target_price, price, price_ts
+
+    def resolved_result(self, slug: str) -> Optional[str]:
+        response = self.http.get(
+            f"{self.cfg.gamma_url}/markets",
+            params={"slug": slug, "limit": 5},
+            timeout=15,
+        )
+        response.raise_for_status()
+        items = response.json()
+        item = next(
+            (x for x in items if x.get("slug") == slug),
+            None,
+        )
+        if not item:
+            return None
+
+        outcomes = parse_array(item.get("outcomes"))
+        prices = parse_array(item.get("outcomePrices"))
+        if len(outcomes) != len(prices) or not prices:
+            return None
+
+        try:
+            nums = [float(x) for x in prices]
+        except (TypeError, ValueError):
+            return None
+
+        best = max(nums)
+        if best < 0.99:
+            return None
+        winner = str(
+            outcomes[nums.index(best)]
+        ).strip().title()
+        return winner if winner in {"Up", "Down"} else None
     
